@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import websockets
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -179,3 +180,73 @@ async def process(req: AnswerRequest):
 @app.get("/health")
 async def health():
     return {"status": "ok", "provider": settings.llm_provider, "active_sessions": len(hub.sessions)}
+
+@app.websocket("/ws/tts")
+async def ws_tts(ws: WebSocket):
+    """
+    STT 워커가 '사용자 답변 텍스트'를 보내는 입구.
+    백엔드가 채점/페르소나/질문 생성 후,
+      - 자막+행동패킷을 Unity(/ws/control)로 push
+      - 면접관 대사를 진짜 TTS(/ws/tts)로 합성해 음성을 STT로 릴레이
+    STT 입장에선 기존 TTS와 동일하게 (음성청크 + {"type":"end"}) 를 받는다.
+    """
+    await ws.accept()
+    print("[/ws/tts] STT 워커 연결됨")
+    try:
+        while True:
+            raw = await ws.receive_text()
+            msg = json.loads(raw)
+            user_text = msg.get("text", "")
+            if not user_text:
+                continue
+
+            sid = hub.last_active or "default"
+            session = hub.sessions.get(sid)
+            if session is None:
+                print("[/ws/tts] 활성 세션 없음 (Unity init 먼저 필요)")
+                await ws.send_json({"type": "end"})
+                continue
+
+            print(f"[STT→백엔드 수신] {user_text}")
+
+            # '생각 중' 모션을 Unity로 먼저
+            await hub.send_packet(sid, BehaviorPacket(
+                type="thinking", session_id=sid, stage=session.stage.value,
+                dialogue="", expression_id=ExpressionID.THINKING.value,
+                gesture_id=GestureID.REVIEW_RESUME.value, score=-1,
+            ))
+
+            # 채점 + 다음 질문 생성
+            packet = await session.on_user_answer(user_text, {})
+            print(f"[백엔드→TTS 대사] {packet.dialogue} "
+                  f"(stage={packet.stage}, persona={packet.persona}, score={packet.score})")
+
+            # 자막 + 행동패킷을 Unity로 (자막=면접관 대사)
+            await hub.send_packet(sid, packet)
+
+            # 면접관 대사를 진짜 TTS로 합성 → 음성을 STT로 릴레이
+            try:
+                async with websockets.connect(settings.tts_ws_url, max_size=None) as tts_ws:
+                    for phrase in tts_client.split_phrases(packet.dialogue):
+                        await tts_ws.send(json.dumps({"text": phrase}))
+                        async for m in tts_ws:
+                            if isinstance(m, str):
+                                if json.loads(m).get("type") == "end":
+                                    break
+                            else:
+                                await ws.send_bytes(m)   # 음성을 STT로 릴레이
+            except Exception as e:
+                print(f"[/ws/tts] TTS 릴레이 실패: {e}")
+
+            # 한 발화 끝 신호 (STT가 이걸 받고 Unity VAD 잠금 해제)
+            await ws.send_json({"type": "end"})
+
+            # 면접 종료면 피드백도 Unity로
+            if packet.is_final:
+                report = await session.build_feedback()
+                await hub.send_json(sid, report.model_dump())
+
+    except WebSocketDisconnect:
+        print("[/ws/tts] STT 워커 연결 종료")
+    except Exception as e:
+        print(f"[/ws/tts] Error: {e}")

@@ -14,7 +14,8 @@ class Settings(BaseSettings):
 
     # TTS 워커(Node B)
     tts_worker_url: str = "http://host.docker.internal:8001/process"
-
+    tts_ws_url: str = "ws://host.docker.internal:8001/ws/tts"
+    
     # 서버
     host: str = "0.0.0.0"
     port: int = 8080
