@@ -136,6 +136,8 @@ async def process(req: AnswerRequest):
     if session is None:
         return JSONResponse({"error": "no active session. Unity must send 'init' first."}, status_code=409)
 
+    print(f"[STT→백엔드 수신] {req.text}")
+    
     # '생각 중' 더미 모션을 즉시 띄워 인지적 대기시간을 가린다 (RTT 제어).
     await hub.send_packet(sid, BehaviorPacket(
         type="thinking", session_id=sid, stage=session.stage.value,
