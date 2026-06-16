@@ -50,17 +50,26 @@ class Hub:
     async def send_packet(self, sid: str, packet: BehaviorPacket):
         ws = self.sockets.get(sid)
         if ws:
-            await ws.send_text(packet.model_dump_json())
+            try:
+                await ws.send_text(packet.model_dump_json())
+            except Exception:
+                self.unregister(sid)
 
     async def send_json(self, sid: str, obj: dict):
         ws = self.sockets.get(sid)
         if ws:
-            await ws.send_text(json.dumps(obj, ensure_ascii=False))
+            try:
+                await ws.send_text(json.dumps(obj, ensure_ascii=False))
+            except Exception:
+                self.unregister(sid)
 
     async def send_audio(self, sid: str, chunk: bytes):
         ws = self.sockets.get(sid)
         if ws:
-            await ws.send_bytes(chunk)
+            try:
+                await ws.send_bytes(chunk)
+            except Exception:
+                self.unregister(sid)
 
 
 hub = Hub()
