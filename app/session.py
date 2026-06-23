@@ -1,11 +1,17 @@
 """
 면접 세션 상태머신. 사용자별로 하나씩 만들어 들고 있으며,
 - 현재 단계(Stage) 진행
+- 자기소개 답변에서 동적 페르소나 정보 추출(extract_info) 후 보관
 - 점수 -> 페르소나(긍정/중립/부정) 가변 전환 + 연속 저점 시 압박 고착
 - 대화 기록(메모리) 누적
 - 멀티모달 피쳐(발화시간/침묵 등) 집계
 - 종료 시 피드백 산출
 을 담당한다.
+
+명세 반영:
+  - 시나리오: 자기소개 답변이 들어오면 그 텍스트에서 회사/직무/경력/기술/강점을
+    추출(llm.extract_info)해 동적 페르소나를 활성화하고, 이후 모든 질문 생성에 주입한다.
+  - 페르소나 변별 핵심 분기: 꼬리질문1, 꼬리질문2.
 
 메모리는 면접이 6턴 내외로 짧으므로 전체 기록을 그대로 보관한다.
 (세션이 길어지면 여기서 요약 압축 = LangChain Summary Memory 역할을 넣으면 된다.)
@@ -15,7 +21,10 @@ from __future__ import annotations
 from . import llm
 from .domain import (
     BehaviorPacket,
+    ExpressionID,
+    ExtractedInfo,
     FeedbackReport,
+    GestureID,
     LLMTurn,
     Persona,
     Stage,
@@ -31,6 +40,10 @@ class InterviewSession:
         self.company = company
         self.job_title = job_title
         self.resume = resume
+
+        # 동적 페르소나 정보: Unity init 값으로 우선 채우고, 자기소개 답변에서 추출해 갱신.
+        self.info = ExtractedInfo(company_name=company, job_role=job_title)
+        self._info_extracted = False  # 자기소개 1회만 추출
 
         self.stage: Stage = Stage.INIT
         self.persona: Persona = Persona.NEUTRAL
@@ -66,7 +79,7 @@ class InterviewSession:
         self._advance_stage()  # INIT -> SELF_INTRO
         turn = await llm.generate_turn(
             stage=self.stage, persona=self.persona,
-            company=self.company, job_title=self.job_title, resume=self.resume,
+            info=self.info, resume=self.resume,
             history="", user_answer="",
         )
         self._record("interviewer", turn.dialogue)
@@ -77,6 +90,20 @@ class InterviewSession:
         self._record("user", text)
         self._collect_features(features)
 
+        # [1단계] 자기소개 답변이면 동적 페르소나 정보 추출 (1회).
+        #  - 현재 단계가 SELF_INTRO == 방금 받은 답변이 자기소개라는 뜻.
+        if self.stage == Stage.SELF_INTRO and not self._info_extracted:
+            extracted = await llm.extract_info(
+                text, fallback_company=self.company, fallback_job=self.job_title
+            )
+            # 추출 결과를 보관(빈 값은 기존 값 유지)
+            self.info = extracted
+            if not self.info.company_name:
+                self.info.company_name = self.company
+            if not self.info.job_role:
+                self.info.job_role = self.job_title
+            self._info_extracted = True
+
         was_closing = self.stage == Stage.CLOSING
         self._advance_stage()
         if was_closing:
@@ -86,15 +113,16 @@ class InterviewSession:
                 session_id=self.session_id, stage=Stage.DONE.value,
                 persona=self.persona.value,
                 dialogue="면접에 응해 주셔서 감사합니다. 잠시 후 결과를 안내해 드리겠습니다.",
-                expression_id=1, gesture_id=1, score=-1, is_final=True,
+                expression_id=ExpressionID.WARM_SMILE.value,
+                gesture_id=GestureID.DEEP_NOD.value, score=-1, is_final=True,
             )
             self._record("interviewer", closing.dialogue)
             return closing
 
-        # 직전 답변을 채점 + 다음 질문 생성
+        # 직전 답변을 채점 + 다음 질문 생성 (동적 페르소나 정보 주입)
         turn = await llm.generate_turn(
             stage=self.stage, persona=self.persona,
-            company=self.company, job_title=self.job_title, resume=self.resume,
+            info=self.info, resume=self.resume,
             history=self._history_text(), user_answer=text,
         )
 
@@ -104,10 +132,9 @@ class InterviewSession:
             self.stage_scores.append((prev_stage_name, turn.score))
             self.consecutive_low = self.consecutive_low + 1 if turn.score < 40 else 0
             self.persona = persona_from_score(turn.score, self.consecutive_low)
-            # 압박 고착: 연속 2회 이상 저점이면 강한 부정 제스처 강제
             turn = llm._clamp_to_set(turn, self.persona)
+            # 압박 고착: 연속 2회 이상 저점이면 강한 부정 제스처 강제
             if self.persona == Persona.NEGATIVE and self.consecutive_low >= 2:
-                from .domain import ExpressionID, GestureID
                 turn.expression_id = ExpressionID.SLIGHT_FROWN.value
                 turn.gesture_id = GestureID.ARMS_CROSSED.value
 
@@ -141,7 +168,8 @@ class InterviewSession:
     async def build_feedback(self) -> FeedbackReport:
         avg_speak = (sum(self.speaking_times) / len(self.speaking_times)) if self.speaking_times else 0.0
         data = await llm.generate_feedback(
-            company=self.company, job_title=self.job_title,
+            company=self.info.company_name or self.company,
+            job_title=self.info.job_role or self.job_title,
             transcript=self._history_text(), stage_scores=self.stage_scores,
             avg_speaking_time=avg_speak, total_pauses=self.total_pauses,
         )

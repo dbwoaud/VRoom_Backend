@@ -157,3 +157,15 @@ class FeedbackReport(BaseModel):
     summary: str = ""
     avg_speaking_time: float = 0.0
     total_pauses: int = 0
+
+class ExtractedInfo(BaseModel):
+    """사용자의 자기소개 답변에서 추출한 동적 페르소나 슬롯.
+ 
+    명세(요구사항/시나리오 [1단계])의 '자기소개 답변이 동적 페르소나를 활성화'를 구현.
+    example.py의 extract_interview_info Function Calling 출력 형식과 동일.
+    """
+    company_name: str = ""                       # 지원 기업명 (없으면 Unity init 값 사용)
+    job_role: str = ""                           # 지원 직무
+    experience_level: str = "신입"               # 신입 | 주니어 | 중급 | 시니어
+    mentioned_skills: List[str] = Field(default_factory=list)   # 언급된 기술 스택
+    key_strengths: List[str] = Field(default_factory=list)      # 강조한 강점
